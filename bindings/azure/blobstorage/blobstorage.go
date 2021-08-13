@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/dapr/components-contrib/bindings"
@@ -278,14 +277,8 @@ func (a *AzureBlobStorage) get(req *bindings.InvokeRequest) (*bindings.InvokeRes
 	metadata := make(map[string]string)
 	res := resp.Response()
 	for k, v := range res.Header {
-		if(k[0:4]=="X-Ms"){
-			metadata[strings.ToLower(k[:])] = v[0]
-		} else {
-			if(k=="Content-Length"){
-				metadata["Sql-"+k] = v[0]
-			} else{
-				metadata[k] = v[0]
-			}
+		if(k=="Content-Length"){
+			metadata[k] = v[0]
 		}
 	}
 
@@ -400,14 +393,8 @@ func (a *AzureBlobStorage) head(req *bindings.InvokeRequest) (*bindings.InvokeRe
 	}
 	resp := props.Response()
 	for k, v := range resp.Header {
-		if(k[0:4]=="X-Ms"){
-			metadata[strings.ToLower(k[:])] = v[0]
-		} else {
-			if(k=="Content-Length"){
-				metadata["Sql-"+k] = v[0]
-			} else{
+		if(k=="Content-Length"){
 				metadata[k] = v[0]
-			}
 		}
 	}
 	return &bindings.InvokeResponse{
