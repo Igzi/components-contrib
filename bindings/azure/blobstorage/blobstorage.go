@@ -275,12 +275,6 @@ func (a *AzureBlobStorage) get(req *bindings.InvokeRequest) (*bindings.InvokeRes
 	}
 
 	metadata := make(map[string]string)
-	res := resp.Response()
-	for k, v := range res.Header {
-		if(k=="Content-Length"){
-			metadata[k] = v[0]
-		}
-	}
 
 	return &bindings.InvokeResponse{
 		Data:     b.Bytes(),
