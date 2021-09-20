@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -28,7 +29,6 @@ const (
 	metadataKeyOffset = "offset"
 	metadataKeyCount = "count"
 	metadataKeyData = "data"
-	MinBufferSize = 5242880
 )
 
 // AWSS3 is a binding for an AWS S3 storage bucket
@@ -38,11 +38,19 @@ type AWSS3 struct {
 	uploader *s3manager.Uploader
 	downloader *s3manager.Downloader
 	logger   logger.Logger
+	backups map[string]Backup
+	S3 *s3.S3
+}
+
+type Backup struct{
 	PartNum int
 	MultipartResponse *s3.CreateMultipartUploadOutput
-	CompletedParts []*s3.CompletedPart
-	buffer []byte
-	S3 *s3.S3
+	CompletedParts []Part
+}
+
+type Part struct{
+	CompletedPart *s3.CompletedPart
+	Offset int64
 }
 
 type s3Metadata struct {
@@ -70,9 +78,7 @@ func (s *AWSS3) Init(metadata bindings.Metadata) error {
 		return err
 	}
 	s.metadata = m
-	s.PartNum = 1
-	s.MultipartResponse = nil
-	s.buffer = nil
+	s.backups = make(map[string]Backup)
 
 	return nil
 }
@@ -109,6 +115,12 @@ func (s *AWSS3) Invoke(req *bindings.InvokeRequest) (*bindings.InvokeResponse, e
 }
 
 func (s *AWSS3) create(req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
+	//Check if the file already exists
+	_, err := s.head(req)
+	if(err == nil){
+		return nil, fmt.Errorf("File already exisists")
+	}
+
 	key := ""
 	if val, ok := req.Metadata[metadataKeyBlobName]; ok && val != "" {
 		key = val
@@ -124,7 +136,7 @@ func (s *AWSS3) create(req *bindings.InvokeRequest) (*bindings.InvokeResponse, e
 		Body:   r,
 	}
 
-	_, err := s.uploader.Upload(&requestInput)
+	_, err = s.uploader.Upload(&requestInput)
 
 	return nil, err
 }
@@ -199,104 +211,96 @@ func (s *AWSS3) head(req *bindings.InvokeRequest) (*bindings.InvokeResponse, err
 	}, err
 }
 
+func (s *AWSS3) initbackup(key string ) (error){
+	backup, ok := s.backups[key]
+
+	if(ok) {
+		return nil
+	}
+
+	MultipartResponse, err := s.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.metadata.Bucket),
+		Key:    aws.String(key),
+	})
+	if(err != nil){
+		return err
+	}
+	backup.MultipartResponse = MultipartResponse
+	backup.PartNum = 1
+	backup.CompletedParts = nil
+	s.backups[key] = backup
+
+	return nil
+}
+
 func (s *AWSS3) put(req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
 	buffer, _ := hex.DecodeString(req.Metadata[metadataKeyData])
+	key, _ := req.Metadata[metadataKeyBlobName]
+	err := s.initbackup(key)
 
-	if(s.MultipartResponse == nil) {
-		s.MultipartResponse, _ = s.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
-			Bucket: aws.String(s.metadata.Bucket),
-			Key:    aws.String(req.Metadata[metadataKeyBlobName]),
-		})
+	if(err != nil){
+		return nil,err
 	}
 
-	if(s.buffer == nil){
-		s.buffer = buffer
-	} else{
-		s.buffer = append(s.buffer,buffer...)
-	}
-
-	if(len(s.buffer) < MinBufferSize){
-		return nil,nil
-	}
-
+	backup := s.backups[key]
 	uploadResp, err := s.S3.UploadPart(&s3.UploadPartInput{
-		Body:          bytes.NewReader(s.buffer),
-		Bucket:        s.MultipartResponse.Bucket,
-		Key:           s.MultipartResponse.Key,
-		PartNumber:    aws.Int64(int64(s.PartNum)),
-		UploadId:      s.MultipartResponse.UploadId,
-		ContentLength: aws.Int64(int64(len(s.buffer))),
+		Body:          bytes.NewReader(buffer),
+		Bucket:        backup.MultipartResponse.Bucket,
+		Key:           backup.MultipartResponse.Key,
+		PartNumber:    aws.Int64(int64(s.backups[key].PartNum)),
+		UploadId:      backup.MultipartResponse.UploadId,
+		ContentLength: aws.Int64(int64(len(buffer))),
 	})
-
-	s.buffer = nil
 
 	if err != nil {
 		s.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
-			Bucket:   s.MultipartResponse.Bucket,
-			Key:      s.MultipartResponse.Key,
-			UploadId: s.MultipartResponse.UploadId,
+			Bucket:   backup.MultipartResponse.Bucket,
+			Key:      backup.MultipartResponse.Key,
+			UploadId: backup.MultipartResponse.UploadId,
 		})
-		s.PartNum = 1
-		s.MultipartResponse = nil
-		s.CompletedParts = nil
+		delete(s.backups,key)
 	} else{
-		s.CompletedParts = append(s.CompletedParts, &s3.CompletedPart{
+		CompletedPart := &s3.CompletedPart{
 			ETag:       uploadResp.ETag,
-			PartNumber: aws.Int64(int64(s.PartNum)),
-		})
-		s.PartNum++
+			PartNumber: aws.Int64(int64(backup.PartNum)),
+		}
+		Offset, _ := strconv.ParseInt(req.Metadata[metadataKeyOffset],10,64)
+		backup.CompletedParts = append(backup.CompletedParts, Part{CompletedPart: CompletedPart, Offset: Offset})
+		backup.PartNum++
+		s.backups[key] = backup
 	}
 
 	return nil, err
 }
 
 func (s *AWSS3) putblocklist(req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
-	if(s.MultipartResponse == nil) {
-		return nil, nil
+	key, _ := req.Metadata[metadataKeyBlobName]
+	err := s.initbackup(key)
+
+	if(err != nil){
+		return nil, err
 	}
 
-	uploadResp, err := s.S3.UploadPart(&s3.UploadPartInput{
-		Body:          bytes.NewReader(s.buffer),
-		Bucket:        s.MultipartResponse.Bucket,
-		Key:           s.MultipartResponse.Key,
-		PartNumber:    aws.Int64(int64(s.PartNum)),
-		UploadId:      s.MultipartResponse.UploadId,
-		ContentLength: aws.Int64(int64(len(s.buffer))),
+	backup := s.backups[key]
+	sort.SliceStable(backup.CompletedParts, func(i, j int) bool {
+		return backup.CompletedParts[i].Offset < backup.CompletedParts[j].Offset
 	})
 
-	s.buffer = nil
-
-	if err != nil {
-		s.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
-			Bucket:   s.MultipartResponse.Bucket,
-			Key:      s.MultipartResponse.Key,
-			UploadId: s.MultipartResponse.UploadId,
-		})
-		s.PartNum = 1
-		s.MultipartResponse = nil
-		s.CompletedParts = nil
-
-		return nil,err
-	} else{
-		s.CompletedParts = append(s.CompletedParts, &s3.CompletedPart{
-			ETag:       uploadResp.ETag,
-			PartNumber: aws.Int64(int64(s.PartNum)),
-		})
-		s.PartNum++
+	var CompletedParts = make([]*s3.CompletedPart,len(backup.CompletedParts))
+	for i:=0; i < len(backup.CompletedParts); i++{
+		CompletedParts[i] = backup.CompletedParts[i].CompletedPart
 	}
 
 	_,err = s.S3.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
-		Bucket:   s.MultipartResponse.Bucket,
-		Key:      s.MultipartResponse.Key,
-		UploadId: s.MultipartResponse.UploadId,
+		Bucket:   backup.MultipartResponse.Bucket,
+		Key:      backup.MultipartResponse.Key,
+		UploadId: backup.MultipartResponse.UploadId,
 		MultipartUpload: &s3.CompletedMultipartUpload{
-			Parts: s.CompletedParts,
+			Parts: CompletedParts,
 		},
 	})
 
-	s.MultipartResponse = nil
-	s.CompletedParts = nil
-	s.PartNum = 1
+	delete(s.backups,key)
 	return nil, err
 }
 
