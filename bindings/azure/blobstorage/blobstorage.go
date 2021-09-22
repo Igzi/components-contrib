@@ -66,6 +66,10 @@ const (
 	metadataKeyContentDispositionBC    = "ContentDisposition"
 	metadataKeyCacheControlBC          = "CacheControl"
 	metadataKeyDeleteSnapshotOptionsBC = "DeleteSnapshotOptions"
+
+	Head = "head"
+	Put = "put"
+	PutBlockList ="putblocklist"
 )
 
 var ErrMissingBlobName = errors.New("blobName is a required attribute")
@@ -172,9 +176,9 @@ func (a *AzureBlobStorage) Operations() []bindings.OperationKind {
 		bindings.GetOperation,
 		bindings.DeleteOperation,
 		bindings.ListOperation,
-		"head",
-		"put",
-		"putblocklist",
+		Head,
+		Put,
+		PutBlockList,
 	}
 }
 
@@ -282,6 +286,19 @@ func (a *AzureBlobStorage) get(req *bindings.InvokeRequest) (*bindings.InvokeRes
 	}
 
 	metadata := make(map[string]string)
+	fetchMetadata, err := req.GetMetadataAsBool(metadataKeyIncludeMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing metadata: %w", err)
+	}
+
+	if fetchMetadata {
+		props, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{})
+		if err != nil {
+			return nil, fmt.Errorf("error reading blob metadata: %w", err)
+		}
+
+		metadata = props.NewMetadata()
+	}
 
 	return &bindings.InvokeResponse{
 		Data:     b.Bytes(),
@@ -398,6 +415,11 @@ func (a *AzureBlobStorage) head(req *bindings.InvokeRequest) (*bindings.InvokeRe
 				metadata[k] = v[0]
 		}
 	}
+
+	if _, ok := metadata["Content-Length"]; !ok {
+		return nil, fmt.Errorf("Missing Content Length")
+	}
+
 	return &bindings.InvokeResponse{
 		Metadata: metadata,
 	}, nil
@@ -413,12 +435,13 @@ func (a *AzureBlobStorage) put(req *bindings.InvokeRequest) (*bindings.InvokeRes
 
 	buffer, _ := hex.DecodeString(req.Metadata[metadataKeyData])
 
-	BlockID := ""
+	var BlockID string
+	Leadingzeros := make([]byte, 64-len(req.Metadata[metadataKeyOffset]))
 	//Add leading zeroes to make all BlockIds have the same length
-	for i:=0; i<(64-len(req.Metadata[metadataKeyOffset])); i++ {
-		BlockID += "0"
+	for i:=0; i<len(BlockID); i++ {
+		Leadingzeros[i] = '0'
 	}
-	BlockID += req.Metadata[metadataKeyOffset]
+	BlockID = string(Leadingzeros) + req.Metadata[metadataKeyOffset]
 	a.BlockIDs = append(a.BlockIDs, BlockID)
 
 	ctx := context.TODO()
@@ -460,11 +483,11 @@ func (a *AzureBlobStorage) Invoke(req *bindings.InvokeRequest) (*bindings.Invoke
 		return a.delete(req)
 	case bindings.ListOperation:
 		return a.list(req)
-	case "head":
+	case Head:
 		return a.head(req)
-	case "put":
+	case Put:
 		return a.put(req)
-	case "putblocklist":
+	case PutBlockList:
 		return a.putblocklist(req)
 	default:
 		return nil, fmt.Errorf("unsupported operation %s", req.Operation)

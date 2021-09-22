@@ -29,6 +29,9 @@ const (
 	metadataKeyOffset = "offset"
 	metadataKeyCount = "count"
 	metadataKeyData = "data"
+	Head = "head"
+	Put = "put"
+	PutBlockList ="putblocklist"
 )
 
 // AWSS3 is a binding for an AWS S3 storage bucket
@@ -43,14 +46,8 @@ type AWSS3 struct {
 }
 
 type Backup struct{
-	PartNum int
 	MultipartResponse *s3.CreateMultipartUploadOutput
-	CompletedParts []Part
-}
-
-type Part struct{
-	CompletedPart *s3.CompletedPart
-	Offset int64
+	CompletedParts []*s3.CompletedPart
 }
 
 type s3Metadata struct {
@@ -88,9 +85,9 @@ func (s *AWSS3) Operations() []bindings.OperationKind {
 		bindings.CreateOperation,
 		bindings.GetOperation,
 		bindings.DeleteOperation,
-		"head",
-		"put",
-		"putblocklist",
+		Head,
+		Put,
+		PutBlockList,
 	}
 }
 
@@ -103,11 +100,11 @@ func (s *AWSS3) Invoke(req *bindings.InvokeRequest) (*bindings.InvokeResponse, e
 		return s.get(req)
 	case bindings.DeleteOperation:
 		return s.delete(req)
-	case "head":
+	case Head:
 		return s.head(req)
-	case "put":
+	case Put:
 		return s.put(req)
-	case "putblocklist":
+	case PutBlockList:
 		return s.putblocklist(req)
 	default:
 		return nil, fmt.Errorf("unsupported operation %s", req.Operation)
@@ -226,7 +223,6 @@ func (s *AWSS3) initbackup(key string ) (error){
 		return err
 	}
 	backup.MultipartResponse = MultipartResponse
-	backup.PartNum = 1
 	backup.CompletedParts = nil
 	s.backups[key] = backup
 
@@ -243,11 +239,12 @@ func (s *AWSS3) put(req *bindings.InvokeRequest) (*bindings.InvokeResponse, erro
 	}
 
 	backup := s.backups[key]
+	PartNum, _ := strconv.ParseInt(req.Metadata[metadataKeyOffset],10,64)
 	uploadResp, err := s.S3.UploadPart(&s3.UploadPartInput{
 		Body:          bytes.NewReader(buffer),
 		Bucket:        backup.MultipartResponse.Bucket,
 		Key:           backup.MultipartResponse.Key,
-		PartNumber:    aws.Int64(int64(s.backups[key].PartNum)),
+		PartNumber:    aws.Int64(PartNum),
 		UploadId:      backup.MultipartResponse.UploadId,
 		ContentLength: aws.Int64(int64(len(buffer))),
 	})
@@ -262,11 +259,9 @@ func (s *AWSS3) put(req *bindings.InvokeRequest) (*bindings.InvokeResponse, erro
 	} else{
 		CompletedPart := &s3.CompletedPart{
 			ETag:       uploadResp.ETag,
-			PartNumber: aws.Int64(int64(backup.PartNum)),
+			PartNumber: aws.Int64(PartNum),
 		}
-		Offset, _ := strconv.ParseInt(req.Metadata[metadataKeyOffset],10,64)
-		backup.CompletedParts = append(backup.CompletedParts, Part{CompletedPart: CompletedPart, Offset: Offset})
-		backup.PartNum++
+		backup.CompletedParts = append(backup.CompletedParts, CompletedPart)
 		s.backups[key] = backup
 	}
 
@@ -283,20 +278,15 @@ func (s *AWSS3) putblocklist(req *bindings.InvokeRequest) (*bindings.InvokeRespo
 
 	backup := s.backups[key]
 	sort.SliceStable(backup.CompletedParts, func(i, j int) bool {
-		return backup.CompletedParts[i].Offset < backup.CompletedParts[j].Offset
+		return *(backup.CompletedParts[i].PartNumber) < *(backup.CompletedParts[j].PartNumber)
 	})
-
-	var CompletedParts = make([]*s3.CompletedPart,len(backup.CompletedParts))
-	for i:=0; i < len(backup.CompletedParts); i++{
-		CompletedParts[i] = backup.CompletedParts[i].CompletedPart
-	}
 
 	_,err = s.S3.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
 		Bucket:   backup.MultipartResponse.Bucket,
 		Key:      backup.MultipartResponse.Key,
 		UploadId: backup.MultipartResponse.UploadId,
 		MultipartUpload: &s3.CompletedMultipartUpload{
-			Parts: CompletedParts,
+			Parts: backup.CompletedParts,
 		},
 	})
 
