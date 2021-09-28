@@ -435,17 +435,22 @@ func (a *AzureBlobStorage) put(req *bindings.InvokeRequest) (*bindings.InvokeRes
 
 	buffer, _ := hex.DecodeString(req.Metadata[metadataKeyData])
 
-	var BlockID string
-	Leadingzeros := make([]byte, 64-len(req.Metadata[metadataKeyOffset]))
+	BlockID := make([]byte, 64)
+	offset := req.Metadata[metadataKeyOffset]
 	//Add leading zeroes to make all BlockIds have the same length
-	for i:=0; i<len(BlockID); i++ {
-		Leadingzeros[i] = '0'
+	l := 64-len(offset)
+	for i:=0; i<64; i++ {
+		if(i<l) {
+			BlockID[i] = '0'
+		} else{
+			BlockID[i] = offset[i-l]
+		}
 	}
-	BlockID = string(Leadingzeros) + req.Metadata[metadataKeyOffset]
-	a.BlockIDs = append(a.BlockIDs, BlockID)
+	BlockId := string(BlockID)
+	a.BlockIDs = append(a.BlockIDs, BlockId)
 
 	ctx := context.TODO()
-	_, err := blobURL.StageBlock(ctx,BlockID,bytes.NewReader(buffer), azblob.LeaseAccessConditions{}, nil)
+	_, err := blobURL.StageBlock(ctx,BlockId,bytes.NewReader(buffer), azblob.LeaseAccessConditions{}, nil)
 
 	return &bindings.InvokeResponse{}, err
 }
